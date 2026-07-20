@@ -405,6 +405,28 @@ class SandboxSession(BaseSandboxSession):
             except Exception as e:
                 duration_ms = (time.monotonic() - t0) * 1000.0
                 expected_span_error = isinstance(e, expected_span_errors)
+                try:
+                    await self._emit_finish_event(
+                        op=op,
+                        span_id=span_id,
+                        parent_span_id=parent_span_id,
+                        trace_id=trace_id,
+                        duration_ms=duration_ms,
+                        ok=False,
+                        exc=e,
+                        data=start_data,
+                        stdout=None,
+                        stderr=None,
+                    )
+                except Exception as sink_error:
+                    self._apply_trace_finish_data(
+                        span=trace_span,
+                        op=op,
+                        ok=False,
+                        data=start_data,
+                        exc=sink_error,
+                    )
+                    raise
                 self._apply_trace_finish_data(
                     span=trace_span,
                     op=op,
@@ -412,42 +434,40 @@ class SandboxSession(BaseSandboxSession):
                     data=start_data,
                     exc=None if expected_span_error else e,
                 )
-                await self._emit_finish_event(
-                    op=op,
-                    span_id=span_id,
-                    parent_span_id=parent_span_id,
-                    trace_id=trace_id,
-                    duration_ms=duration_ms,
-                    ok=False,
-                    exc=e,
-                    data=start_data,
-                    stdout=None,
-                    stderr=None,
-                )
                 raise
 
             data_finish = finish_data(value) if finish_data is not None else start_data
             ok_value = ok(value) if ok is not None else True
             stdout, stderr = outputs(value) if outputs is not None else (None, None)
             duration_ms = (time.monotonic() - t0) * 1000.0
+            try:
+                await self._emit_finish_event(
+                    op=op,
+                    span_id=span_id,
+                    parent_span_id=parent_span_id,
+                    trace_id=trace_id,
+                    duration_ms=duration_ms,
+                    ok=ok_value,
+                    exc=None,
+                    data=data_finish,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+            except Exception as sink_error:
+                self._apply_trace_finish_data(
+                    span=trace_span,
+                    op=op,
+                    ok=False,
+                    data=data_finish,
+                    exc=sink_error,
+                )
+                raise
             self._apply_trace_finish_data(
                 span=trace_span,
                 op=op,
                 ok=ok_value,
                 data=data_finish,
                 exc=None,
-            )
-            await self._emit_finish_event(
-                op=op,
-                span_id=span_id,
-                parent_span_id=parent_span_id,
-                trace_id=trace_id,
-                duration_ms=duration_ms,
-                ok=ok_value,
-                exc=None,
-                data=data_finish,
-                stdout=stdout,
-                stderr=stderr,
             )
             return value
 

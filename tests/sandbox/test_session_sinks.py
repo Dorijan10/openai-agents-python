@@ -511,6 +511,36 @@ async def test_expected_read_span_error_is_call_scoped_and_preserves_audit_failu
 
 
 @pytest.mark.asyncio
+async def test_expected_read_span_records_finish_sink_failure(tmp_path: Path) -> None:
+    def fail_read_finish(event: SandboxSessionEvent, _session: BaseSandboxSession) -> None:
+        if isinstance(event, SandboxSessionFinishEvent) and event.op == "read":
+            raise ValueError("simulated sink failure")
+
+    instrumentation = Instrumentation(
+        sinks=[CallbackSink(fail_read_finish, mode="sync", on_error="raise")]
+    )
+    inner = _build_unix_local_session(tmp_path)
+
+    with trace("sandbox_expected_read_sink_failure_test"):
+        async with SandboxSession(inner, instrumentation=instrumentation) as session:
+            with pytest.raises(RuntimeError, match="sandbox event sink failed"):
+                await _read_with_expected_span_errors(
+                    session,
+                    Path("expected-missing.txt"),
+                    expected_span_errors=(WorkspaceReadNotFoundError,),
+                )
+
+    read_span = next(
+        span
+        for span in fetch_ordered_spans()
+        if span.span_data.export().get("name") == "sandbox.read"
+    )
+    assert read_span.error is not None
+    assert read_span.error["message"] == "RuntimeError"
+    assert read_span.span_data.data["error_type"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
 async def test_sandbox_session_ops_nest_under_sdk_trace_and_events_carry_trace_ids(
     tmp_path: Path,
 ) -> None:

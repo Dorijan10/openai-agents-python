@@ -42,7 +42,6 @@ from ..errors import (
     ExposedPortUnavailableError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
-    WorkspaceReadNotFoundError,
 )
 from ..manifest import Manifest
 from ..session import SandboxSession, SandboxSessionState
@@ -90,78 +89,6 @@ logger = logging.getLogger(__name__)
 # RAM and spill larger ones to a temp file so a big upload can't OOM the process.
 _STREAM_SPOOL_MAX_SIZE = 16 * 1024 * 1024
 _DEFERRED_CLEANUP_TIMEOUT_S = 30.0
-_READ_PATH_PROBE_SCRIPT = """
-# READ_PATH_PROBE_V1
-path=$1
-
-resolve_probe_path() {
-    resolve_path=$1
-    symlink_depth=$2
-
-    if [ "$symlink_depth" -gt 40 ]; then
-        return 2
-    fi
-    if [ "$resolve_path" = "/" ]; then
-        printf '/\n'
-        return 0
-    fi
-
-    parent=${resolve_path%/*}
-    base=${resolve_path##*/}
-    if [ -z "$parent" ] || [ "$parent" = "$resolve_path" ]; then
-        parent=/
-    fi
-    resolved_parent=$(resolve_probe_path "$parent" "$symlink_depth") || return 2
-    if [ "$resolved_parent" = "/" ]; then
-        candidate=/$base
-    else
-        candidate=$resolved_parent/$base
-    fi
-
-    if [ -L "$candidate" ]; then
-        target=$(readlink "$candidate") || return 2
-        symlink_depth=$((symlink_depth + 1))
-        case "$target" in
-            /*)
-                resolve_probe_path "$target" "$symlink_depth"
-                ;;
-            *)
-                resolve_probe_path "$resolved_parent/$target" "$symlink_depth"
-                ;;
-        esac
-        return $?
-    fi
-
-    printf '%s\n' "$candidate"
-}
-
-candidate=$(resolve_probe_path "$path" 0) || exit 2
-path=$candidate
-child=
-
-while :; do
-    if [ -e "$candidate" ]; then
-        if [ "$candidate" = "$path" ]; then
-            exit 0
-        fi
-        if [ ! -d "$candidate" ] || [ ! -x "$candidate" ]; then
-            exit 2
-        fi
-        if [ -e "$child" ]; then
-            exit 2
-        fi
-        exit 1
-    fi
-    if [ "$candidate" = "/" ]; then
-        exit 2
-    fi
-    child=$candidate
-    candidate=${candidate%/*}
-    if [ -z "$candidate" ]; then
-        candidate=/
-    fi
-done
-""".strip()
 
 
 def _measure_stream(stream: io.IOBase) -> tuple[int, io.IOBase, io.IOBase | None]:
@@ -860,27 +787,13 @@ class DockerSandboxSession(BaseSandboxSession):
         workspace_path_arg = sandbox_path_str(workspace_path)
         res = await self.exec("cat", "--", workspace_path_arg, shell=False, user=user)
         if not res.ok():
-            context: dict[str, object] = {
-                "command": ["cat", "--", workspace_path_arg],
-                "stdout": res.stdout.decode("utf-8", errors="replace"),
-                "stderr": res.stderr.decode("utf-8", errors="replace"),
-            }
-            exists_result = await self.exec(
-                "sh",
-                "-c",
-                _READ_PATH_PROBE_SCRIPT,
-                "sh",
-                workspace_path_arg,
-                shell=False,
+            await self._raise_read_error_from_exec(
+                path=path,
+                workspace_path=workspace_path,
+                command=("cat", "--", workspace_path_arg),
+                result=res,
                 user=user,
             )
-            context["existence_probe_exit_code"] = exists_result.exit_code
-            context["existence_probe_stderr"] = exists_result.stderr.decode(
-                "utf-8", errors="replace"
-            )
-            if exists_result.ok() or exists_result.exit_code != 1:
-                raise WorkspaceArchiveReadError(path=path, context=context)
-            raise WorkspaceReadNotFoundError(path=path, context=context)
         return io.BytesIO(res.stdout)
 
     async def write(
