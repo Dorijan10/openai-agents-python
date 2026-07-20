@@ -47,6 +47,7 @@ from .runtime_helpers import (
     RuntimeHelperScript,
 )
 from .sandbox_session_state import SandboxSessionState
+from .utils import _safe_decode
 
 _PtyEntryT = TypeVar("_PtyEntryT")
 _RUNTIME_HELPER_CACHE_KEY_UNSET = object()
@@ -85,7 +86,8 @@ resolve_probe_path() {
     fi
 
     if [ -L "$candidate" ]; then
-        target=$(readlink "$candidate") || return 2
+        target_with_marker=$(readlink -n "$candidate" && printf .) || return 2
+        target=${target_with_marker%.}
         symlink_depth=$((symlink_depth + 1))
         if [ "$symlink_depth" -gt 40 ]; then
             return 2
@@ -117,7 +119,15 @@ while :; do
         if [ ! -d "$candidate" ] || [ ! -x "$candidate" ]; then
             exit 2
         fi
-        if [ -e "$child" ]; then
+        child_name=${child##*/}
+        entry_probe=$(
+            find "$candidate" -mindepth 1 -maxdepth 1 -name "$child_name" -print 2>/dev/null
+            find_status=$?
+            printf '.%s' "$find_status"
+        )
+        find_status=${entry_probe##*.}
+        entry_probe=${entry_probe%.*}
+        if [ "$find_status" -ne 0 ] || [ -n "$entry_probe" ]; then
             exit 2
         fi
         exit 1
@@ -889,8 +899,8 @@ class BaseSandboxSession(abc.ABC):
     ) -> NoReturn:
         context: dict[str, object] = {
             "command": [str(part) for part in command],
-            "stdout": result.stdout.decode("utf-8", errors="replace"),
-            "stderr": result.stderr.decode("utf-8", errors="replace"),
+            "stdout_bytes": len(result.stdout),
+            "stderr": _safe_decode(result.stderr, max_chars=4096),
         }
         if result.exit_code != 1:
             raise WorkspaceArchiveReadError(path=path, context=context)
@@ -910,8 +920,8 @@ class BaseSandboxSession(abc.ABC):
             raise WorkspaceArchiveReadError(path=path, context=context, cause=e) from e
 
         context["existence_probe_exit_code"] = probe_result.exit_code
-        context["existence_probe_stdout"] = probe_result.stdout.decode("utf-8", errors="replace")
-        context["existence_probe_stderr"] = probe_result.stderr.decode("utf-8", errors="replace")
+        context["existence_probe_stdout_bytes"] = len(probe_result.stdout)
+        context["existence_probe_stderr"] = _safe_decode(probe_result.stderr, max_chars=4096)
         if probe_result.exit_code == 1:
             raise WorkspaceReadNotFoundError(path=path, context=context)
         raise WorkspaceArchiveReadError(path=path, context=context)

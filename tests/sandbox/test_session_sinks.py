@@ -541,6 +541,45 @@ async def test_expected_read_span_records_finish_sink_failure(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_exec_span_records_cancellation_during_finish_sink_delivery(tmp_path: Path) -> None:
+    finish_delivery_started = asyncio.Event()
+    completed_exit_codes: list[int] = []
+
+    async def block_exec_finish(event: SandboxSessionEvent, _session: BaseSandboxSession) -> None:
+        if isinstance(event, SandboxSessionFinishEvent) and event.op == "exec":
+            exit_code = event.data["exit_code"]
+            assert isinstance(exit_code, int)
+            completed_exit_codes.append(exit_code)
+            finish_delivery_started.set()
+            await asyncio.Event().wait()
+
+    instrumentation = Instrumentation(
+        sinks=[CallbackSink(block_exec_finish, mode="sync", on_error="raise")]
+    )
+    inner = _build_unix_local_session(tmp_path)
+
+    with trace("sandbox_exec_finish_cancellation_test"):
+        async with SandboxSession(inner, instrumentation=instrumentation) as session:
+            exec_task = asyncio.create_task(session.exec("exit 7"))
+            await finish_delivery_started.wait()
+            exec_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await exec_task
+
+    exec_span = next(
+        span
+        for span in fetch_ordered_spans()
+        if span.span_data.export().get("name") == "sandbox.exec"
+    )
+    assert exec_span.error is not None
+    assert exec_span.error["message"] == "CancelledError"
+    assert exec_span.span_data.data["error_type"] == "CancelledError"
+    assert completed_exit_codes
+    assert exec_span.span_data.data["exit_code"] == completed_exit_codes[0]
+    assert exec_span.span_data.data["process.exit.code"] == completed_exit_codes[0]
+
+
+@pytest.mark.asyncio
 async def test_sandbox_session_ops_nest_under_sdk_trace_and_events_carry_trace_ids(
     tmp_path: Path,
 ) -> None:

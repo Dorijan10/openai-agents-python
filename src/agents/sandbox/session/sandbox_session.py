@@ -418,7 +418,7 @@ class SandboxSession(BaseSandboxSession):
                         stdout=None,
                         stderr=None,
                     )
-                except Exception as sink_error:
+                except BaseException as sink_error:
                     self._apply_trace_finish_data(
                         span=trace_span,
                         op=op,
@@ -453,7 +453,7 @@ class SandboxSession(BaseSandboxSession):
                     stdout=stdout,
                     stderr=stderr,
                 )
-            except Exception as sink_error:
+            except BaseException as sink_error:
                 self._apply_trace_finish_data(
                     span=trace_span,
                     op=op,

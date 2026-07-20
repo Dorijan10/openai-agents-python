@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import shlex
 import subprocess
 import sys
@@ -288,6 +289,23 @@ async def test_check_read_with_exec_treats_nonstandard_check_exit_as_archive_err
     assert len(session.commands) == 1
 
 
+@pytest.mark.asyncio
+async def test_read_error_context_does_not_retain_partial_stdout() -> None:
+    partial_stdout = b"sensitive partial contents" * 1024
+    session = _QueuedExecSession(
+        [
+            ExecResult(stdout=partial_stdout, stderr=b"read failed", exit_code=1),
+            ExecResult(stdout=b"", stderr=b"", exit_code=2),
+        ]
+    )
+
+    with pytest.raises(WorkspaceArchiveReadError) as exc_info:
+        await session._check_read_with_exec(Path("target.txt"))
+
+    assert "stdout" not in exc_info.value.context
+    assert exc_info.value.context["stdout_bytes"] == len(partial_stdout)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell behavior is Unix-specific")
 def test_read_path_probe_resolves_symlinks_before_classifying_missing(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
@@ -304,6 +322,10 @@ def test_read_path_probe_resolves_symlinks_before_classifying_missing(tmp_path: 
     invalid_parent.symlink_to("not-a-directory")
     loop = workspace / "loop"
     loop.symlink_to("loop")
+    newline_target = workspace / "newline-target\n"
+    newline_target.write_text("content", encoding="utf-8")
+    newline_link = workspace / "newline-link"
+    newline_link.symlink_to(newline_target.name)
     current = workspace
     symlink_parts: list[str] = []
     for index in range(41):
@@ -314,11 +336,12 @@ def test_read_path_probe_resolves_symlinks_before_classifying_missing(tmp_path: 
         symlink_parts.append(link_name)
         current = real
 
-    def probe(path: Path) -> int:
+    def probe(path: Path, *, env: dict[str, str] | None = None) -> int:
         result = subprocess.run(
             ["sh", "-c", _READ_PATH_PROBE_SCRIPT, "sh", str(path)],
             check=False,
             capture_output=True,
+            env=env,
             timeout=5,
         )
         return result.returncode
@@ -328,8 +351,20 @@ def test_read_path_probe_resolves_symlinks_before_classifying_missing(tmp_path: 
     assert probe(dangling_parent / "child") == 1
     assert probe(invalid_parent / "child") == 2
     assert probe(loop) == 2
+    assert probe(newline_link) == 0
     assert probe(workspace.joinpath(*symlink_parts, "missing")) == 2
     assert probe(workspace / ("x" * 256)) == 2
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_find = fake_bin / "find"
+    fake_find.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_find.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    assert probe(workspace / "missing", env=env) == 2
+    fake_find.write_text("#!/bin/sh\nprintf match\n", encoding="utf-8")
+    assert probe(workspace / "missing", env=env) == 2
 
 
 @pytest.mark.parametrize(
