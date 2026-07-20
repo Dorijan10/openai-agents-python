@@ -7,6 +7,8 @@ import io
 import queue
 import shutil
 import socket
+import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -46,7 +48,9 @@ from agents.sandbox.errors import (
     InvalidManifestPathError,
     MountConfigError,
     PtySessionNotFoundError,
+    WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
+    WorkspaceReadNotFoundError,
 )
 from agents.sandbox.files import EntryKind, FileEntry
 from agents.sandbox.manifest import Manifest
@@ -298,6 +302,7 @@ class _HostBackedDockerSession(DockerSandboxSession):
         manifest: Manifest,
         event_log: list[tuple[str, str]] | None = None,
         archive_error: Exception | None = None,
+        read_probe_exit_code: int | None = None,
     ) -> None:
         container = _FakeDockerContainer(host_root, archive_error=archive_error)
         state = DockerSandboxSessionState(
@@ -314,6 +319,19 @@ class _HostBackedDockerSession(DockerSandboxSession):
         self._host_root = host_root
         self._fake_container = container
         self._event_log = event_log if event_log is not None else []
+        self._read_probe_exit_code = read_probe_exit_code
+        self._read_probe_users: list[str | None] = []
+
+    async def _exec_internal_for_user(
+        self,
+        *command: str | Path,
+        timeout: float | None = None,
+        user: str | None = None,
+    ) -> ExecResult:
+        cmd = [str(part) for part in command]
+        if cmd[:2] == ["sh", "-c"] and "READ_PATH_PROBE_V1" in cmd[2]:
+            self._read_probe_users.append(user)
+        return await self._exec_internal(*command, timeout=timeout)
 
     async def _exec_internal(
         self,
@@ -327,6 +345,15 @@ class _HostBackedDockerSession(DockerSandboxSession):
             return ExecResult(stdout=b"", stderr=b"", exit_code=0)
         if cmd == ["test", "-x", helper_path]:
             return ExecResult(stdout=b"", stderr=b"", exit_code=0)
+        if cmd[:2] == ["sh", "-c"] and "READ_PATH_PROBE_V1" in cmd[2]:
+            if self._read_probe_exit_code is not None:
+                return ExecResult(
+                    stdout=b"",
+                    stderr=b"",
+                    exit_code=self._read_probe_exit_code,
+                )
+            exists = self._host_path(cmd[4]).exists()
+            return ExecResult(stdout=b"", stderr=b"", exit_code=0 if exists else 1)
         if cmd and cmd[0] == helper_path:
             for_write = cmd[3]
             candidate = self._host_path(cmd[2]).resolve(strict=False)
@@ -1301,6 +1328,95 @@ async def test_docker_read_returns_file_bytes_without_archive_api(tmp_path: Path
 
     assert data.read() == b"hello\x00world"
     assert session._fake_container.archive_calls == []
+
+
+@pytest.mark.asyncio
+async def test_docker_read_missing_path_raises_not_found_error(tmp_path: Path) -> None:
+    host_root = tmp_path / "container"
+    (host_root / "workspace").mkdir(parents=True)
+    session = _HostBackedDockerSession(
+        host_root=host_root,
+        manifest=Manifest(root="/workspace"),
+    )
+
+    with pytest.raises(WorkspaceReadNotFoundError):
+        await session.read(Path("missing.txt"))
+
+
+@pytest.mark.asyncio
+async def test_docker_read_existing_unreadable_path_raises_archive_error(tmp_path: Path) -> None:
+    host_root = tmp_path / "container"
+    unreadable_path = host_root / "workspace" / "directory"
+    unreadable_path.mkdir(parents=True)
+    session = _HostBackedDockerSession(
+        host_root=host_root,
+        manifest=Manifest(root="/workspace"),
+    )
+
+    with pytest.raises(WorkspaceArchiveReadError):
+        await session.read(Path("directory"))
+
+
+@pytest.mark.asyncio
+async def test_docker_read_indeterminate_probe_raises_archive_error(tmp_path: Path) -> None:
+    host_root = tmp_path / "container"
+    (host_root / "workspace").mkdir(parents=True)
+    session = _HostBackedDockerSession(
+        host_root=host_root,
+        manifest=Manifest(root="/workspace"),
+        read_probe_exit_code=2,
+    )
+
+    with pytest.raises(WorkspaceArchiveReadError):
+        await session.read(Path("inaccessible/missing.txt"))
+
+
+@pytest.mark.asyncio
+async def test_docker_read_probe_uses_requested_user(tmp_path: Path) -> None:
+    host_root = tmp_path / "container"
+    (host_root / "workspace").mkdir(parents=True)
+    session = _HostBackedDockerSession(
+        host_root=host_root,
+        manifest=Manifest(root="/workspace"),
+    )
+
+    with pytest.raises(WorkspaceReadNotFoundError):
+        await session.read(Path("missing.txt"), user="sandbox-user")
+
+    assert session._read_probe_users == ["sandbox-user"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell behavior is Unix-specific")
+def test_docker_read_probe_resolves_symlinks_before_classifying_missing(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    dangling = workspace / "dangling"
+    dangling.symlink_to("missing")
+    non_directory = workspace / "not-a-directory"
+    non_directory.write_text("content", encoding="utf-8")
+    invalid_target = workspace / "invalid-target"
+    invalid_target.symlink_to("not-a-directory/child")
+    dangling_parent = workspace / "dangling-parent"
+    dangling_parent.symlink_to("missing-directory")
+    invalid_parent = workspace / "invalid-parent"
+    invalid_parent.symlink_to("not-a-directory")
+    loop = workspace / "loop"
+    loop.symlink_to("loop")
+
+    def probe(path: Path) -> int:
+        result = subprocess.run(
+            ["sh", "-c", docker_sandbox._READ_PATH_PROBE_SCRIPT, "sh", str(path)],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode
+
+    assert probe(dangling) == 1
+    assert probe(invalid_target) == 2
+    assert probe(dangling_parent / "child") == 1
+    assert probe(invalid_parent / "child") == 2
+    assert probe(loop) == 2
 
 
 @pytest.mark.asyncio
