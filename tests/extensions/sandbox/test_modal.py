@@ -594,7 +594,7 @@ async def test_modal_read_classifies_nonzero_cat_with_path_probe(
 
     assert len(commands) == 2
     assert commands[0][0:2] == ("sh", "-lc")
-    assert "READ_PATH_PROBE_V2" in commands[1][2]
+    assert "READ_PATH_PROBE_V3" in commands[1][2]
 
 
 @pytest.mark.asyncio

@@ -327,7 +327,7 @@ class _HostBackedDockerSession(DockerSandboxSession):
         user: str | None = None,
     ) -> ExecResult:
         cmd = [str(part) for part in command]
-        if cmd[:2] == ["sh", "-c"] and "READ_PATH_PROBE_V2" in cmd[2]:
+        if cmd[:2] == ["sh", "-c"] and "READ_PATH_PROBE_V3" in cmd[2]:
             self._read_probe_users.append(user)
         return await self._exec_internal(*command, timeout=timeout)
 
@@ -343,7 +343,7 @@ class _HostBackedDockerSession(DockerSandboxSession):
             return ExecResult(stdout=b"", stderr=b"", exit_code=0)
         if cmd == ["test", "-x", helper_path]:
             return ExecResult(stdout=b"", stderr=b"", exit_code=0)
-        if cmd[:2] == ["sh", "-c"] and "READ_PATH_PROBE_V2" in cmd[2]:
+        if cmd[:2] == ["sh", "-c"] and "READ_PATH_PROBE_V3" in cmd[2]:
             if self._read_probe_exit_code is not None:
                 return ExecResult(
                     stdout=b"",

@@ -19,7 +19,11 @@ from agents.sandbox.errors import (
 from agents.sandbox.files import EntryKind, FileEntry
 from agents.sandbox.manifest import Manifest
 from agents.sandbox.session import SandboxSessionStartEvent
-from agents.sandbox.session.base_sandbox_session import _READ_PATH_PROBE_SCRIPT, BaseSandboxSession
+from agents.sandbox.session.base_sandbox_session import (
+    _READ_PATH_PROBE_SCRIPT,
+    _READ_PATH_PROBE_TIMEOUT_S,
+    BaseSandboxSession,
+)
 from agents.sandbox.session.events import SandboxSessionFinishEvent, validate_sandbox_session_event
 from agents.sandbox.session.utils import (
     _best_effort_stream_len,
@@ -83,14 +87,15 @@ class _QueuedExecSession(_CaptureExecSession):
         super().__init__()
         self._results = list(results)
         self.commands: list[tuple[str, ...]] = []
+        self.timeouts: list[float | None] = []
 
     async def _exec_internal(
         self,
         *command: str | Path,
         timeout: float | None = None,
     ) -> ExecResult:
-        _ = timeout
         self.commands.append(tuple(str(part) for part in command))
+        self.timeouts.append(timeout)
         return self._results.pop(0)
 
 
@@ -276,7 +281,8 @@ async def test_check_read_with_exec_classifies_failure_as_requested_user(
 
     assert len(session.commands) == 2
     assert all(command[:4] == ("sudo", "-u", "sandbox-user", "--") for command in session.commands)
-    assert "READ_PATH_PROBE_V2" in session.commands[1][6]
+    assert "READ_PATH_PROBE_V3" in session.commands[1][6]
+    assert session.timeouts == [None, _READ_PATH_PROBE_TIMEOUT_S]
 
 
 @pytest.mark.asyncio
@@ -326,6 +332,7 @@ def test_read_path_probe_resolves_symlinks_before_classifying_missing(tmp_path: 
     newline_target.write_text("content", encoding="utf-8")
     newline_link = workspace / "newline-link"
     newline_link.symlink_to(newline_target.name)
+    (workspace / "a").write_text("sibling", encoding="utf-8")
     current = workspace
     symlink_parts: list[str] = []
     for index in range(41):
@@ -352,19 +359,34 @@ def test_read_path_probe_resolves_symlinks_before_classifying_missing(tmp_path: 
     assert probe(invalid_parent / "child") == 2
     assert probe(loop) == 2
     assert probe(newline_link) == 0
+    assert probe(workspace / "[a]") == 1
+    assert probe(workspace / "?") == 1
+    assert probe(workspace / "*") == 1
     assert probe(workspace.joinpath(*symlink_parts, "missing")) == 2
     assert probe(workspace / ("x" * 256)) == 2
 
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     fake_find = fake_bin / "find"
-    fake_find.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    find_args_log = tmp_path / "find-args.log"
+    fake_find.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$FIND_ARGS_LOG"\n'
+        'printf "find: %s: Input/output error\\n" "$1" >&2\nexit 1\n',
+        encoding="utf-8",
+    )
     fake_find.chmod(0o755)
     env = dict(os.environ)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    assert probe(workspace / "missing", env=env) == 2
+    env["FIND_ARGS_LOG"] = str(find_args_log)
+    missing_path = workspace / "missing"
+    assert probe(missing_path, env=env) == 2
+    assert find_args_log.read_text(encoding="utf-8").splitlines() == [
+        str(missing_path),
+        "-prune",
+        "-print",
+    ]
     fake_find.write_text("#!/bin/sh\nprintf match\n", encoding="utf-8")
-    assert probe(workspace / "missing", env=env) == 2
+    assert probe(missing_path, env=env) == 2
 
 
 @pytest.mark.parametrize(

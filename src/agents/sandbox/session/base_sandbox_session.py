@@ -52,8 +52,9 @@ from .utils import _safe_decode
 _PtyEntryT = TypeVar("_PtyEntryT")
 _RUNTIME_HELPER_CACHE_KEY_UNSET = object()
 _WORKSPACE_ROOT_PROBE_TIMEOUT_S = 10.0
+_READ_PATH_PROBE_TIMEOUT_S = 10.0
 _READ_PATH_PROBE_SCRIPT = """
-# READ_PATH_PROBE_V2
+# READ_PATH_PROBE_V3
 LC_ALL=C
 export LC_ALL
 path=$1
@@ -119,18 +120,22 @@ while :; do
         if [ ! -d "$candidate" ] || [ ! -x "$candidate" ]; then
             exit 2
         fi
-        child_name=${child##*/}
-        entry_probe=$(
-            find "$candidate" -mindepth 1 -maxdepth 1 -name "$child_name" -print 2>/dev/null
-            find_status=$?
-            printf '.%s' "$find_status"
+        lookup_result=$(
+            find "$child" -prune -print 2>&1 >/dev/null
+            lookup_status=$?
+            printf '.%s' "$lookup_status"
         )
-        find_status=${entry_probe##*.}
-        entry_probe=${entry_probe%.*}
-        if [ "$find_status" -ne 0 ] || [ -n "$entry_probe" ]; then
-            exit 2
+        lookup_status=${lookup_result##*.}
+        lookup_error=${lookup_result%.*}
+        if [ "$lookup_status" -eq 1 ]; then
+            lookup_error=$(printf %s "$lookup_error")
+            case "$lookup_error" in
+                *": No such file or directory")
+                    exit 1
+                    ;;
+            esac
         fi
-        exit 1
+        exit 2
     fi
     if [ "$candidate" = "/" ]; then
         exit 2
@@ -913,6 +918,7 @@ class BaseSandboxSession(abc.ABC):
                 _READ_PATH_PROBE_SCRIPT,
                 "sh",
                 workspace_path_arg,
+                timeout=_READ_PATH_PROBE_TIMEOUT_S,
                 shell=False,
                 user=user,
             )
